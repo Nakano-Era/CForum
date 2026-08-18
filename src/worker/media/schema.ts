@@ -99,6 +99,10 @@ export const bindUploadSchema = z
   })
   .strict();
 
+export const bindAvatarSchema = z
+  .object({ uploadId: uploadIdSchema })
+  .strict();
+
 export const mediaVariantSchema = z.enum(["main", "thumbnail"]);
 
 export type AuthorizeUploadsInput = z.infer<typeof authorizeUploadsSchema>;

@@ -17,6 +17,7 @@ import {
   listCategories,
 } from "@/worker/repositories/forum";
 import { nowSeconds } from "@/worker/security/crypto";
+import { avatarUrl } from "@/worker/media/avatar-url";
 import {
   recordTopicRead,
   replyCreatedActivityStatement,
@@ -55,6 +56,8 @@ const createReplySchema = z.object({
     .refine((value) => value.trim().length > 0, "回复不能为空"),
   replyToPostId: idSchema.optional(),
 });
+
+const topicPinSchema = z.object({ desired: z.boolean() }).strict();
 
 interface FeedCursor {
   rank: number;
@@ -129,6 +132,7 @@ interface FeedRow {
   author_id: string;
   username: string;
   display_name: string;
+  avatar_upload_id: string | null;
   author_trust_level: TrustLevel;
   tags_json: string;
   reply_count: number;
@@ -147,6 +151,19 @@ interface FeedRow {
   public_to_guest: number;
 }
 
+interface CommunityPulseRow {
+  members_online: number;
+  new_topics_today: number;
+  replies_today: number;
+  active_members_this_week: number;
+}
+
+interface CategoryFeedCountRow {
+  category_id: string;
+  topic_count: number;
+  unread_count: number;
+}
+
 interface TopicDetailRow {
   id: string;
   slug: string;
@@ -156,6 +173,7 @@ interface TopicDetailRow {
   effective_min_view_level: TrustLevel;
   reply_count: number;
   like_count: number;
+  pinned_at: number | null;
   bumped_at: number;
   created_at: number;
   category_id: string;
@@ -165,6 +183,7 @@ interface TopicDetailRow {
   author_id: string;
   username: string;
   display_name: string;
+  avatar_upload_id: string | null;
   trust_level: TrustLevel;
 }
 
@@ -181,6 +200,7 @@ interface PostDetailRow {
   author_id: string;
   username: string;
   display_name: string;
+  avatar_upload_id: string | null;
   trust_level: TrustLevel;
 }
 
@@ -225,7 +245,8 @@ router.get("/feed", async (context) => {
   if (!parsed.success) {
     return context.json({ error: { code: "INVALID_QUERY" } }, 422);
   }
-  const { viewer } = context.get("identity");
+  const identity = context.get("identity");
+  const { viewer } = identity;
   if (
     (parsed.data.tab === "following" || parsed.data.tab === "unread") &&
     !viewer.userId
@@ -297,7 +318,13 @@ router.get("/feed", async (context) => {
     bindings.push(cursor.rank, cursor.rank, cursor.value, cursor.value, cursor.id);
   }
 
-  const orderBy = `${rankExpression} DESC, ${valueExpression} DESC, t.id DESC`;
+  // A bare integer in ORDER BY is treated as a result-column position by
+  // SQLite. `ORDER BY 0` therefore fails for every non-"all" tab instead of
+  // behaving as a constant rank. Only include the pinned rank when it matters.
+  const orderBy =
+    parsed.data.tab === "all"
+      ? `${rankExpression} DESC, ${valueExpression} DESC, t.id DESC`
+      : `${valueExpression} DESC, t.id DESC`;
   bindings.push(21);
   const result = await context.env.CFORUM_DB.prepare(
     `SELECT
@@ -307,6 +334,7 @@ router.get("/feed", async (context) => {
        c.color AS category_color, c.acl_mode AS category_acl_mode,
        t.effective_min_view_level,
        author.id AS author_id, author.username, author.display_name,
+       author.avatar_upload_id,
        author.trust_level AS author_trust_level,
        COALESCE((
          SELECT json_group_array(tag_name)
@@ -367,7 +395,97 @@ router.get("/feed", async (context) => {
   const pageRows = result.results.slice(0, 20);
   const hasMore = result.results.length > 20;
   const nextRow = hasMore ? pageRows.at(-1) : null;
-  const [categoryRecords, unreadNotificationRow] = await Promise.all([
+  const generatedAt = nowSeconds();
+  if (identity.session) {
+    try {
+      await context.env.CFORUM_DB.prepare(
+        `UPDATE sessions
+         SET last_seen_at = ?1
+         WHERE id = ?2 AND last_seen_at < ?3`,
+      )
+        .bind(generatedAt, identity.session.id, generatedAt - 60)
+        .run();
+    } catch (error) {
+      // Presence is informative only; a failed heartbeat must not make the
+      // discussion feed unavailable.
+      console.error("feed_presence_update_failed", {
+        requestId: context.get("requestId"),
+        name: error instanceof Error ? error.name : "unknown",
+      });
+    }
+  }
+
+  const dayStart = Math.floor(generatedAt / 86_400) * 86_400;
+  const pulseStatement = context.env.CFORUM_DB.prepare(
+    `SELECT
+       (
+         SELECT COUNT(DISTINCT online_session.user_id)
+         FROM sessions online_session
+         JOIN users online_user ON online_user.id = online_session.user_id
+         WHERE online_session.revoked_at IS NULL
+           AND online_session.expires_at > ?
+           AND online_session.last_seen_at >= ?
+           AND online_user.status IN ('active', 'silenced')
+       ) AS members_online,
+       (
+         SELECT COUNT(*)
+         FROM topics t
+         JOIN categories c ON c.id = t.category_id
+         WHERE ${scope.clause}
+           AND t.created_at >= ?
+       ) AS new_topics_today,
+       (
+         SELECT COUNT(*)
+         FROM posts pulse_post
+         JOIN topics t ON t.id = pulse_post.topic_id
+         JOIN categories c ON c.id = t.category_id
+         WHERE ${scope.clause}
+           AND pulse_post.status = 'published'
+           AND pulse_post.post_number > 1
+           AND pulse_post.created_at >= ?
+       ) AS replies_today,
+       (
+         SELECT COUNT(DISTINCT activity.user_id)
+         FROM user_activity_daily activity
+         JOIN users active_user ON active_user.id = activity.user_id
+         WHERE activity.activity_date >= date(?, 'unixepoch', '-6 days')
+           AND activity.active = 1
+           AND active_user.status IN ('active', 'silenced')
+       ) AS active_members_this_week`,
+  ).bind(
+    generatedAt,
+    generatedAt - 5 * 60,
+    ...scope.bindings,
+    dayStart,
+    ...scope.bindings,
+    dayStart,
+    dayStart,
+  );
+
+  const categoryCountsStatement = context.env.CFORUM_DB.prepare(
+    `SELECT
+       c.id AS category_id,
+       COUNT(*) AS topic_count,
+       SUM(
+         CASE WHEN ? != ''
+           AND COALESCE(category_read.last_read_post_number, 0) < t.last_post_number
+         THEN 1 ELSE 0 END
+       ) AS unread_count
+     FROM topics t
+     JOIN categories c ON c.id = t.category_id
+     LEFT JOIN topic_reads category_read
+       ON category_read.topic_id = t.id AND category_read.user_id = ?
+     WHERE ${scope.clause}
+     GROUP BY c.id`,
+  )
+    .bind(viewerId, viewerId, ...scope.bindings);
+
+  const [
+    categoryRecords,
+    unreadNotificationRow,
+    pulseRow,
+    categoryCountResult,
+  ] = await Promise.all([
     listCategories(context.env.CFORUM_DB),
     viewer.userId
       ? context.env.CFORUM_DB.prepare(
@@ -377,9 +495,20 @@ router.get("/feed", async (context) => {
           .bind(viewer.userId)
           .first<{ count: number }>()
       : Promise.resolve(null),
+    pulseStatement.first<CommunityPulseRow>(),
+    categoryCountsStatement.all<CategoryFeedCountRow>(),
   ]);
   const categories = categoryRecords.filter((category) =>
     canViewCategory(viewer, category),
+  );
+  const categoryCounts = new Map(
+    categoryCountResult.results.map((row) => [
+      row.category_id,
+      {
+        topicCount: Number(row.topic_count ?? 0),
+        unreadCount: Number(row.unread_count ?? 0),
+      },
+    ]),
   );
 
   const topics = pageRows.map((row) => ({
@@ -400,6 +529,7 @@ router.get("/feed", async (context) => {
       handle: row.username,
       initials: initials(row.display_name),
       avatarTone: avatarTone(row.author_id),
+      avatarUrl: avatarUrl(row.avatar_upload_id),
       trustLevel: row.author_trust_level,
     },
     tags: JSON.parse(row.tags_json) as string[],
@@ -449,18 +579,18 @@ router.get("/feed", async (context) => {
       name: category.name,
       description: category.description,
       accent: category.color,
-      topicCount: 0,
-      unreadCount: 0,
+      topicCount: categoryCounts.get(category.id)?.topicCount ?? 0,
+      unreadCount: categoryCounts.get(category.id)?.unreadCount ?? 0,
       minViewLevel: category.minViewLevel,
       allowedTopicMinLevelMax: category.allowedTopicMinLevelMax,
       allowImages: category.allowImages,
       canCreate: evaluateCreateTopic(viewer, category, 0).allowed,
     })),
     pulse: {
-      membersOnline: 0,
-      newTopicsToday: 0,
-      repliesToday: 0,
-      activeMembersThisWeek: 0,
+      membersOnline: Number(pulseRow?.members_online ?? 0),
+      newTopicsToday: Number(pulseRow?.new_topics_today ?? 0),
+      repliesToday: Number(pulseRow?.replies_today ?? 0),
+      activeMembersThisWeek: Number(pulseRow?.active_members_this_week ?? 0),
     },
     nextCursor:
       nextRow && hasMore
@@ -471,7 +601,7 @@ router.get("/feed", async (context) => {
             id: nextRow.id,
           })
         : null,
-    generatedAt: new Date().toISOString(),
+    generatedAt: isoFromSeconds(generatedAt),
   });
 });
 
@@ -611,6 +741,93 @@ router.post("/topics", async (context) => {
   );
 });
 
+router.patch("/topics/:id/pin", async (context) => {
+  const identity = context.get("identity");
+  if (!identity.session || !identity.viewer.userId) {
+    return context.json({ error: { code: "AUTHENTICATION_REQUIRED" } }, 401);
+  }
+  if (
+    identity.viewer.role !== "admin" ||
+    identity.viewer.status !== "active"
+  ) {
+    return context.json({ error: { code: "ACTION_NOT_ALLOWED" } }, 403);
+  }
+
+  const topicId = context.req.param("id");
+  if (!idSchema.safeParse(topicId).success) {
+    return context.json({ error: { code: "NOT_FOUND" } }, 404);
+  }
+  const parsed = topicPinSchema.safeParse(
+    await context.req.json().catch(() => null),
+  );
+  if (!parsed.success) {
+    return context.json({ error: { code: "INVALID_INPUT" } }, 422);
+  }
+
+  const now = nowSeconds();
+  const desired = parsed.data.desired;
+  const mutation = desired
+    ? context.env.CFORUM_DB.prepare(
+        `UPDATE topics
+         SET pinned_at = ?1, updated_at = ?1
+         WHERE id = ?2
+           AND pinned_at IS NULL
+           AND status IN ('open', 'locked', 'archived')
+           AND approval_status = 'approved'`,
+      ).bind(now, topicId)
+    : context.env.CFORUM_DB.prepare(
+        `UPDATE topics
+         SET pinned_at = NULL, updated_at = ?1
+         WHERE id = ?2
+           AND pinned_at IS NOT NULL
+           AND status IN ('open', 'locked', 'archived')
+           AND approval_status = 'approved'`,
+      ).bind(now, topicId);
+
+  const results = await context.env.CFORUM_DB.batch([
+    mutation,
+    context.env.CFORUM_DB.prepare(
+      `INSERT INTO audit_logs(
+         id, occurred_at, actor_user_id, actor_role, action, target_type,
+         target_id, category_id, request_id, before_json, after_json
+       )
+       SELECT
+         ?1, ?2, ?3, 'admin', ?4, 'topic',
+         topic.id, topic.category_id, ?6, ?7, ?8
+       FROM topics topic
+       WHERE topic.id = ?5 AND changes() = 1`,
+    ).bind(
+      crypto.randomUUID(),
+      now,
+      identity.viewer.userId,
+      desired ? "topic.pin" : "topic.unpin",
+      topicId,
+      context.get("requestId"),
+      JSON.stringify({ pinned: !desired }),
+      JSON.stringify({ pinned: desired }),
+    ),
+    context.env.CFORUM_DB.prepare(
+      `SELECT id, pinned_at
+       FROM topics
+       WHERE id = ?1
+         AND status IN ('open', 'locked', 'archived')
+         AND approval_status = 'approved'
+       LIMIT 1`,
+    ).bind(topicId),
+  ]);
+  const state = results[2]?.results[0] as
+    | { id: string; pinned_at: number | null }
+    | undefined;
+  if (!state) {
+    return context.json({ error: { code: "NOT_FOUND" } }, 404);
+  }
+
+  return context.json({
+    topic: { id: state.id, pinned: state.pinned_at !== null },
+    changed: Number(results[0]?.meta.changes ?? 0) === 1,
+  });
+});
+
 router.get("/topics/:id", async (context) => {
   const topicId = context.req.param("id");
   if (!idSchema.safeParse(topicId).success) {
@@ -634,10 +851,11 @@ router.get("/topics/:id", async (context) => {
       `SELECT
          t.id, t.slug, t.title, t.status, t.min_view_level,
          t.effective_min_view_level, t.reply_count, t.like_count,
-         t.bumped_at, t.created_at,
+         t.pinned_at, t.bumped_at, t.created_at,
          c.id AS category_id, c.slug AS category_slug, c.name AS category_name,
          c.color AS category_color,
-         u.id AS author_id, u.username, u.display_name, u.trust_level
+         u.id AS author_id, u.username, u.display_name, u.trust_level,
+         u.avatar_upload_id
        FROM topics t
        JOIN categories c ON c.id = t.category_id
        JOIN users u ON u.id = t.author_id
@@ -653,7 +871,8 @@ router.get("/topics/:id", async (context) => {
              AND detail_reaction.user_id = ?4
              AND detail_reaction.reaction_type = 'like'
          ) THEN 1 ELSE 0 END AS liked,
-         u.id AS author_id, u.username, u.display_name, u.trust_level
+         u.id AS author_id, u.username, u.display_name, u.trust_level,
+         u.avatar_upload_id
        FROM posts p
        JOIN users u ON u.id = p.author_id
        WHERE p.topic_id = ?1
@@ -718,6 +937,7 @@ router.get("/topics/:id", async (context) => {
       effectiveMinViewLevel: topic.effective_min_view_level,
       replyCount: topic.reply_count,
       likeCount: topic.like_count,
+      pinned: topic.pinned_at !== null,
       bumpedAt: isoFromSeconds(topic.bumped_at),
       createdAt: isoFromSeconds(topic.created_at),
       category: {
@@ -731,6 +951,7 @@ router.get("/topics/:id", async (context) => {
         username: topic.username,
         displayName: topic.display_name,
         trustLevel: topic.trust_level,
+        avatarUrl: avatarUrl(topic.avatar_upload_id),
       },
     },
     posts: posts.map((post) => ({
@@ -746,6 +967,7 @@ router.get("/topics/:id", async (context) => {
         username: post.username,
         displayName: post.display_name,
         trustLevel: post.trust_level,
+        avatarUrl: avatarUrl(post.avatar_upload_id),
       },
     })),
     tags: tagsResult.results,

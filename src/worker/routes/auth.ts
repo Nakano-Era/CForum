@@ -23,6 +23,7 @@ import {
   EMAIL_REQUEST_TURNSTILE_ACTION,
   verifyTurnstileToken,
 } from "@/worker/security/turnstile";
+import { avatarUrl } from "@/worker/media/avatar-url";
 
 const emailSchema = z
   .string()
@@ -501,7 +502,8 @@ router.post("/email/consume-login", async (context) => {
   const account = await context.env.CFORUM_DB.prepare(
     `SELECT
        ev.code_hash,
-       u.id, u.username, u.display_name, u.trust_level, u.role, u.status
+       u.id, u.username, u.display_name, u.trust_level, u.role, u.status,
+       u.avatar_upload_id
      FROM email_verifications ev
      JOIN user_emails ue ON ue.email_normalized = ev.email_normalized
      JOIN users u ON u.id = ue.user_id
@@ -523,6 +525,7 @@ router.post("/email/consume-login", async (context) => {
       trust_level: number;
       role: string;
       status: string;
+      avatar_upload_id: string | null;
     }>();
   if (!account || !timingSafeEqual(account.code_hash, expectedTicketHash)) {
     return context.json(
@@ -581,6 +584,7 @@ router.post("/email/consume-login", async (context) => {
       trustLevel: account.trust_level,
       role: account.role,
       status: account.status,
+      avatarUrl: avatarUrl(account.avatar_upload_id),
     },
     csrfToken: preparedSession.csrfToken,
   });
@@ -592,7 +596,8 @@ router.get("/session", async (context) => {
     return context.json({ authenticated: false });
   }
   const user = await context.env.CFORUM_DB.prepare(
-    `SELECT id, username, display_name, trust_level, role, status
+    `SELECT id, username, display_name, trust_level, role, status,
+            avatar_upload_id
      FROM users WHERE id = ?1 LIMIT 1`,
   )
     .bind(identity.viewer.userId)
@@ -603,6 +608,7 @@ router.get("/session", async (context) => {
       trust_level: number;
       role: string;
       status: string;
+      avatar_upload_id: string | null;
     }>();
   if (!user) return context.json({ authenticated: false });
   return context.json({
@@ -614,6 +620,7 @@ router.get("/session", async (context) => {
       trustLevel: user.trust_level,
       role: user.role,
       status: user.status,
+      avatarUrl: avatarUrl(user.avatar_upload_id),
     },
   });
 });
