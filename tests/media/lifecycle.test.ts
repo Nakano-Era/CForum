@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { Bindings } from "@/worker/env";
 import { MediaError } from "@/worker/media/errors";
 import {
+  bindAvatarUpload,
   bindUpload,
   copyObjectsForBinding,
   deriveBoundMediaScope,
   derivePostMediaScope,
   isBoundObjectKey,
   reconcileBoundUploadScope,
+  serveAvatar,
   serveMedia,
   type ObjectMove,
 } from "@/worker/media/lifecycle";
@@ -27,6 +29,7 @@ const TOPIC_ID = "22222222-2222-4222-8222-222222222222";
 const POST_ID = "33333333-3333-4333-8333-333333333333";
 const OWNER_ID = "44444444-4444-4444-8444-444444444444";
 const ATTEMPT_ID = "55555555-5555-4555-8555-555555555555";
+const OLD_AVATAR_ID = "99999999-9999-4999-8999-999999999999";
 const SOURCE_MAIN =
   `tmp/${OWNER_ID}/66666666-6666-4666-8666-666666666666.png`;
 const SOURCE_THUMB =
@@ -237,6 +240,269 @@ function idempotentDatabase(): D1Database {
       ];
     },
   } as unknown as D1Database;
+}
+
+function avatarBindingDatabase(
+  contentHash: string,
+  oldMainKey: string,
+  oldThumbnailKey: string,
+  failRetirementRead = false,
+): D1Database {
+  let batchNumber = 0;
+  return {
+    prepare(sql: string) {
+      let bindings: unknown[] = [];
+      const statement = {
+        sql,
+        bind(...values: unknown[]) {
+          bindings = values;
+          return statement;
+        },
+        async first() {
+          if (sql.includes("FROM uploads") && bindings[0] === OLD_AVATAR_ID) {
+            if (failRetirementRead) {
+              throw new Error("simulated retirement read failure");
+            }
+            return {
+              id: OLD_AVATAR_ID,
+              owner_user_id: OWNER_ID,
+              topic_id: null,
+              post_id: null,
+              scope: "public",
+              state: "bound",
+              object_key: oldMainKey,
+              content_hash: contentHash,
+              mime_type: "image/png",
+              byte_size: 24,
+              width: 1,
+              height: 1,
+            };
+          }
+          return null;
+        },
+        async all() {
+          if (sql.includes("FROM upload_variants") && bindings[0] === OLD_AVATAR_ID) {
+            return result([
+              {
+                id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                upload_id: OLD_AVATAR_ID,
+                kind: "thumbnail",
+                object_key: oldThumbnailKey,
+                content_hash: contentHash,
+                mime_type: "image/png",
+                byte_size: 24,
+                width: 1,
+                height: 1,
+              },
+            ]);
+          }
+          return result([]);
+        },
+        async run() {
+          return { ...result([]), meta: { changes: 1 } } as unknown as D1Result;
+        },
+      };
+      return statement;
+    },
+    async batch(statements: D1PreparedStatement[]) {
+      batchNumber += 1;
+      if (batchNumber === 1) {
+        return [
+          result([
+            {
+              id: UPLOAD_ID,
+              owner_user_id: OWNER_ID,
+              topic_id: null,
+              post_id: null,
+              scope: "temporary",
+              state: "uploaded",
+              object_key: SOURCE_MAIN,
+              content_hash: contentHash,
+              mime_type: "image/png",
+              byte_size: 24,
+              width: 1,
+              height: 1,
+            },
+          ]),
+          result([
+            {
+              id: "88888888-8888-4888-8888-888888888888",
+              upload_id: UPLOAD_ID,
+              kind: "thumbnail",
+              object_key: SOURCE_THUMB,
+              content_hash: contentHash,
+              mime_type: "image/png",
+              byte_size: 24,
+              width: 1,
+              height: 1,
+            },
+          ]),
+          result([
+            {
+              id: OWNER_ID,
+              status: "active",
+              avatar_upload_id: OLD_AVATAR_ID,
+            },
+          ]),
+        ];
+      }
+      return statements.map(
+        () => ({ ...result([]), meta: { changes: 1 } }) as unknown as D1Result,
+      );
+    },
+  } as unknown as D1Database;
+}
+
+function avatarMediaDatabase(media: Record<string, unknown> | null): D1Database {
+  return {
+    prepare() {
+      const statement = {
+        bind() {
+          return statement;
+        },
+        async first() {
+          return media;
+        },
+      };
+      return statement;
+    },
+  } as unknown as D1Database;
+}
+
+function unavailableAvatarDatabase(
+  upload: Record<string, unknown> | null,
+  variants: Array<Record<string, unknown>> = [],
+): D1Database {
+  return {
+    prepare(sql: string) {
+      const statement = {
+        sql,
+        bind() {
+          return statement;
+        },
+      };
+      return statement;
+    },
+    async batch() {
+      return [
+        result(upload ? [upload] : []),
+        result(variants),
+        result([{ id: OWNER_ID, status: "active", avatar_upload_id: null }]),
+      ];
+    },
+  } as unknown as D1Database;
+}
+
+interface ReplayRaceState {
+  avatarUploadId: string | null;
+  objectKey: string;
+}
+
+function replayRaceDatabase(contentHash: string): {
+  database: D1Database;
+  state: ReplayRaceState;
+} {
+  let batchNumber = 0;
+  const winnerKey = `bound/${UPLOAD_ID}/${ATTEMPT_ID}/main.png`;
+  const state: ReplayRaceState = {
+    avatarUploadId: OLD_AVATAR_ID,
+    objectKey: SOURCE_MAIN,
+  };
+  const database = {
+    prepare(sql: string) {
+      const statement = {
+        sql,
+        bindings: [] as unknown[],
+        bind(...values: unknown[]) {
+          statement.bindings = values;
+          return statement;
+        },
+      };
+      return statement;
+    },
+    async batch(rawStatements: D1PreparedStatement[]) {
+      batchNumber += 1;
+      if (batchNumber === 1) {
+        return [
+          result([
+            {
+              id: UPLOAD_ID,
+              owner_user_id: OWNER_ID,
+              topic_id: null,
+              post_id: null,
+              scope: "temporary",
+              state: "uploaded",
+              object_key: SOURCE_MAIN,
+              content_hash: contentHash,
+              mime_type: "image/png",
+              byte_size: 24,
+              width: 1,
+              height: 1,
+            },
+          ]),
+          result([
+            {
+              id: "88888888-8888-4888-8888-888888888888",
+              upload_id: UPLOAD_ID,
+              kind: "thumbnail",
+              object_key: SOURCE_THUMB,
+              content_hash: contentHash,
+              mime_type: "image/png",
+              byte_size: 24,
+              width: 1,
+              height: 1,
+            },
+          ]),
+          result([
+            {
+              id: OWNER_ID,
+              status: "active",
+              avatar_upload_id: OLD_AVATAR_ID,
+            },
+          ]),
+        ];
+      }
+      if (batchNumber === 2) {
+        // Another invocation commits after this invocation's stale read but
+        // before its conditional UPDATE batch reaches D1.
+        state.avatarUploadId = UPLOAD_ID;
+        state.objectKey = winnerKey;
+        return rawStatements.map(() => result([]));
+      }
+
+      return rawStatements.map((rawStatement) => {
+        const statement = rawStatement as unknown as {
+          sql: string;
+          bindings: unknown[];
+        };
+        let changes = 0;
+        if (statement.sql.includes("UPDATE users")) {
+          const attemptOwnsCurrentUpload = statement.sql.includes("object_key = ?4")
+            ? state.objectKey === statement.bindings[3]
+            : true;
+          if (
+            state.avatarUploadId === statement.bindings[1] &&
+            attemptOwnsCurrentUpload
+          ) {
+            state.avatarUploadId = statement.bindings[2] as string | null;
+            changes = 1;
+          }
+        }
+        if (
+          statement.sql.includes("UPDATE uploads") &&
+          state.objectKey === statement.bindings[3]
+        ) {
+          state.objectKey = statement.bindings[2] as string;
+          changes = 1;
+        }
+        return {
+          ...result([]),
+          meta: { changes },
+        } as unknown as D1Result;
+      });
+    },
+  } as unknown as D1Database;
+  return { database, state };
 }
 
 function mediaDatabase(
@@ -513,6 +779,217 @@ describe("two-phase R2 binding", () => {
     expect(publicBucket.gets).toEqual([]);
   });
 
+  it("binds a finalized upload as the current public avatar and deletes the replaced objects", async () => {
+    const bytes = png(1, 1);
+    const privateBucket = new MemoryBucket();
+    const publicBucket = new MemoryBucket();
+    const oldMainKey = `bound/${OLD_AVATAR_ID}/${ATTEMPT_ID}/main.png`;
+    const oldThumbnailKey = `bound/${OLD_AVATAR_ID}/${ATTEMPT_ID}/thumbnail.png`;
+    await privateBucket.seed(SOURCE_MAIN, bytes);
+    await privateBucket.seed(SOURCE_THUMB, bytes);
+    await publicBucket.seed(oldMainKey, bytes);
+    await publicBucket.seed(oldThumbnailKey, bytes);
+    const stored = privateBucket.objects.get(SOURCE_MAIN);
+    if (!stored) throw new Error("test source object missing");
+
+    const response = await bindAvatarUpload(
+      bindings(
+        avatarBindingDatabase(base64(stored.digest), oldMainKey, oldThumbnailKey),
+        privateBucket.asBucket(),
+        publicBucket.asBucket(),
+      ),
+      makeViewer({ userId: OWNER_ID }),
+      UPLOAD_ID,
+      "request-1",
+    );
+
+    expect(response).toEqual({
+      uploadId: UPLOAD_ID,
+      avatarUrl: `/api/avatars/${UPLOAD_ID}`,
+    });
+    expect(privateBucket.objects.has(SOURCE_MAIN)).toBe(false);
+    expect(privateBucket.objects.has(SOURCE_THUMB)).toBe(false);
+    expect(publicBucket.objects.has(oldMainKey)).toBe(false);
+    expect(publicBucket.objects.has(oldThumbnailKey)).toBe(false);
+    expect(
+      [...publicBucket.objects.keys()].filter((key) => key.includes(UPLOAD_ID)),
+    ).toHaveLength(2);
+  });
+
+  it("keeps the new avatar committed when old-avatar retirement reads fail for Cron recovery", async () => {
+    const bytes = png(1, 1);
+    const privateBucket = new MemoryBucket();
+    const publicBucket = new MemoryBucket();
+    const oldMainKey = `bound/${OLD_AVATAR_ID}/${ATTEMPT_ID}/main.png`;
+    const oldThumbnailKey = `bound/${OLD_AVATAR_ID}/${ATTEMPT_ID}/thumbnail.png`;
+    await privateBucket.seed(SOURCE_MAIN, bytes);
+    await privateBucket.seed(SOURCE_THUMB, bytes);
+    await publicBucket.seed(oldMainKey, bytes);
+    await publicBucket.seed(oldThumbnailKey, bytes);
+    const stored = privateBucket.objects.get(SOURCE_MAIN);
+    if (!stored) throw new Error("test source object missing");
+
+    const response = await bindAvatarUpload(
+      bindings(
+        avatarBindingDatabase(
+          base64(stored.digest),
+          oldMainKey,
+          oldThumbnailKey,
+          true,
+        ),
+        privateBucket.asBucket(),
+        publicBucket.asBucket(),
+      ),
+      makeViewer({ userId: OWNER_ID }),
+      UPLOAD_ID,
+      "request-retirement-read-failure",
+    );
+
+    expect(response.avatarUrl).toBe(`/api/avatars/${UPLOAD_ID}`);
+    expect(publicBucket.objects.has(oldMainKey)).toBe(true);
+    expect(publicBucket.objects.has(oldThumbnailKey)).toBe(true);
+  });
+
+  it("rejects an upload that is not owned and finalized without touching R2", async () => {
+    const privateBucket = new MemoryBucket();
+    const publicBucket = new MemoryBucket();
+    const reserved = {
+      id: UPLOAD_ID,
+      owner_user_id: OWNER_ID,
+      topic_id: null,
+      post_id: null,
+      scope: "temporary",
+      state: "reserved",
+      object_key: SOURCE_MAIN,
+      content_hash: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      mime_type: "image/png",
+      byte_size: 24,
+      width: 1,
+      height: 1,
+    };
+    await expect(
+      bindAvatarUpload(
+        bindings(
+          unavailableAvatarDatabase(reserved),
+          privateBucket.asBucket(),
+          publicBucket.asBucket(),
+        ),
+        makeViewer({ userId: OWNER_ID }),
+        UPLOAD_ID,
+        "request-1",
+      ),
+    ).rejects.toMatchObject({ code: "UPLOAD_NOT_BINDABLE", status: 409 });
+    await expect(
+      bindAvatarUpload(
+        bindings(
+          unavailableAvatarDatabase(null),
+          privateBucket.asBucket(),
+          publicBucket.asBucket(),
+        ),
+        makeViewer({ userId: OWNER_ID }),
+        UPLOAD_ID,
+        "request-1",
+      ),
+    ).rejects.toMatchObject({ code: "UPLOAD_NOT_FOUND", status: 404 });
+    expect(privateBucket.gets).toEqual([]);
+    expect(publicBucket.gets).toEqual([]);
+  });
+
+  it("requires one bounded-size thumbnail instead of ever serving the main upload as an avatar", async () => {
+    const upload = {
+      id: UPLOAD_ID,
+      owner_user_id: OWNER_ID,
+      topic_id: null,
+      post_id: null,
+      scope: "temporary",
+      state: "uploaded",
+      object_key: SOURCE_MAIN,
+      content_hash: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      mime_type: "image/png",
+      byte_size: 24,
+      width: 16_384,
+      height: 16_384,
+    };
+    const oversizedThumbnail = {
+      id: "88888888-8888-4888-8888-888888888888",
+      upload_id: UPLOAD_ID,
+      kind: "thumbnail",
+      object_key: SOURCE_THUMB,
+      content_hash: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      mime_type: "image/png",
+      byte_size: 128 * 1024 + 1,
+      width: 257,
+      height: 256,
+    };
+    const privateBucket = new MemoryBucket();
+    const publicBucket = new MemoryBucket();
+
+    await expect(
+      bindAvatarUpload(
+        bindings(
+          unavailableAvatarDatabase(upload),
+          privateBucket.asBucket(),
+          publicBucket.asBucket(),
+        ),
+        makeViewer({ userId: OWNER_ID }),
+        UPLOAD_ID,
+        "request-no-thumbnail",
+      ),
+    ).rejects.toMatchObject({ code: "UPLOAD_NOT_BINDABLE", status: 409 });
+    await expect(
+      bindAvatarUpload(
+        bindings(
+          unavailableAvatarDatabase(upload, [oversizedThumbnail]),
+          privateBucket.asBucket(),
+          publicBucket.asBucket(),
+        ),
+        makeViewer({ userId: OWNER_ID }),
+        UPLOAD_ID,
+        "request-large-thumbnail",
+      ),
+    ).rejects.toMatchObject({ code: "UPLOAD_NOT_BINDABLE", status: 409 });
+    expect(privateBucket.gets).toEqual([]);
+    expect(publicBucket.gets).toEqual([]);
+  });
+
+  it("does not let a stale replay roll back the winning bind for the same upload", async () => {
+    const bytes = png(1, 1);
+    const privateBucket = new MemoryBucket();
+    const publicBucket = new MemoryBucket();
+    await privateBucket.seed(SOURCE_MAIN, bytes);
+    await privateBucket.seed(SOURCE_THUMB, bytes);
+    const source = privateBucket.objects.get(SOURCE_MAIN);
+    if (!source) throw new Error("test source object missing");
+    const winnerKey = `bound/${UPLOAD_ID}/${ATTEMPT_ID}/main.png`;
+    const winnerThumbnailKey = `bound/${UPLOAD_ID}/${ATTEMPT_ID}/thumbnail.png`;
+    await publicBucket.seed(winnerKey, bytes);
+    await publicBucket.seed(winnerThumbnailKey, bytes);
+    const race = replayRaceDatabase(base64(source.digest));
+
+    await expect(
+      bindAvatarUpload(
+        bindings(
+          race.database,
+          privateBucket.asBucket(),
+          publicBucket.asBucket(),
+        ),
+        makeViewer({ userId: OWNER_ID }),
+        UPLOAD_ID,
+        "stale-request",
+      ),
+    ).rejects.toMatchObject({ code: "UPLOAD_NOT_BINDABLE", status: 409 });
+
+    expect(race.state).toEqual({
+      avatarUploadId: UPLOAD_ID,
+      objectKey: winnerKey,
+    });
+    expect(publicBucket.objects.has(winnerKey)).toBe(true);
+    expect(publicBucket.objects.has(winnerThumbnailKey)).toBe(true);
+    expect([...publicBucket.objects.keys()].sort()).toEqual(
+      [winnerKey, winnerThumbnailKey].sort(),
+    );
+  });
+
   it("promotes an approved post through the retry-safe reconciliation hook", async () => {
     const bytes = png(1, 1);
     const source = new MemoryBucket();
@@ -552,6 +1029,51 @@ describe("two-phase R2 binding", () => {
 });
 
 describe("media access", () => {
+  it("serves only a user's current public avatar and revokes a replaced URL", async () => {
+    const bucket = new MemoryBucket();
+    const key = `bound/${UPLOAD_ID}/${ATTEMPT_ID}/thumbnail.png`;
+    const bytes = png(1, 1);
+    await bucket.seed(key, bytes);
+    const stored = bucket.objects.get(key);
+    if (!stored) throw new Error("test avatar object missing");
+    const row = {
+      upload_id: UPLOAD_ID,
+      object_key: key,
+      content_hash: base64(stored.digest),
+      mime_type: "image/png",
+      byte_size: bytes.byteLength,
+      width: 1,
+      height: 1,
+      object_kind: "thumbnail",
+    };
+    const response = await serveAvatar(
+      bindings(
+        avatarMediaDatabase(row),
+        new MemoryBucket().asBucket(),
+        bucket.asBucket(),
+      ),
+      UPLOAD_ID,
+      "GET",
+    );
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+    expect(JSON.stringify([...response.headers])).not.toContain(key);
+
+    const lookupsBefore = bucket.gets.length;
+    await expect(
+      serveAvatar(
+        bindings(
+          avatarMediaDatabase(null),
+          new MemoryBucket().asBucket(),
+          bucket.asBucket(),
+        ),
+        UPLOAD_ID,
+        "GET",
+      ),
+    ).rejects.toMatchObject({ code: "MEDIA_NOT_FOUND", status: 404 });
+    expect(bucket.gets).toHaveLength(lookupsBefore);
+  });
+
   it("re-checks a private topic and conceals media after group access is lost", async () => {
     const privateBucket = new MemoryBucket();
     await expect(

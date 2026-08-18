@@ -18,6 +18,7 @@ import {
   nowSeconds,
   timingSafeEqual,
 } from "@/worker/security/crypto";
+import { avatarUrl } from "@/worker/media/avatar-url";
 
 export const WEBAUTHN_CHALLENGE_TTL_SECONDS = 5 * 60;
 export const WEBAUTHN_OPERATION_TIMEOUT_MS =
@@ -88,6 +89,7 @@ export interface AuthenticatedPasskeyUser {
   trustLevel: number;
   role: UserRole;
   status: "active" | "silenced";
+  avatarUrl: string | null;
 }
 
 export interface PreparedPasskeyAuthentication {
@@ -100,6 +102,7 @@ interface RegistrationUserRow {
   username: string;
   display_name: string;
   status: UserStatus;
+  avatar_upload_id: string | null;
 }
 
 interface PasskeyRow {
@@ -116,6 +119,7 @@ interface PasskeyRow {
   trust_level: number;
   role: UserRole;
   status: UserStatus;
+  avatar_upload_id: string | null;
 }
 
 function misconfigured(): never {
@@ -603,7 +607,8 @@ export async function verifyAndPreparePasskeyAuthentication(
     `SELECT
        p.id, p.user_id, p.credential_id, p.public_key, p.counter,
        p.device_type, p.backed_up, p.transports_json,
-       u.username, u.display_name, u.trust_level, u.role, u.status
+       u.username, u.display_name, u.trust_level, u.role, u.status,
+       u.avatar_upload_id
      FROM passkeys p
      JOIN users u ON u.id = p.user_id
      WHERE p.credential_id = ?1
@@ -723,6 +728,7 @@ export async function verifyAndPreparePasskeyAuthentication(
       trustLevel: passkey.trust_level,
       role: passkey.role,
       status: passkey.status as "active" | "silenced",
+      avatarUrl: avatarUrl(passkey.avatar_upload_id),
     },
   };
 }

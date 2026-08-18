@@ -10,16 +10,16 @@ CForum 是一个从零实现的 Cloudflare-native 中文轻量论坛。它参考
 - Hono Worker，同时提供 Fetch、Queue Consumer 与 Scheduled Handler。
 - D1 版本化 migrations，覆盖账号、Passkey、会话、邀请、等级、板块、主题、互动、通知、审核、媒体、容量和审计数据。
 - 中央权限服务：Guest/Lv0–Lv4、等级与 Group ACL 交集、精确板块版主范围、管理员策略、作者降级只读和附件继承。
-- 8,200 项权限、安全、认证、媒体、搜索、互动、维护模式和邀请测试，包含完整等级/ACL 参数化矩阵。
+- 8,200+ 项权限、安全、认证、媒体、搜索、互动、维护模式和管理后台测试，包含完整等级/ACL 参数化矩阵。
 - 首次安装管理员、公开站点配置、健康检查、三种注册模式、邮箱 OTP、Turnstile、Passkey 与可吊销 Cookie Session。
 - 综合/最新/热门/关注/未读 Feed、FTS 搜索、板块、主题/回复、幂等点赞/收藏与 Lv0 审核入口。
 - 浏览器图片方向修正、元数据剥离、自适应压缩、R2 批量上传许可、Lv0–Lv4 每日额度、7/8GB 软硬闸门、SigV4 直传、finalize、帖子绑定与受控读取。
 - 中文响应式论坛界面、安装向导、真实登录/注册/发帖/回复/互动流程、通知面板、staff 审核工作台、非阻断 Passkey 强提示、深色模式和基础无障碍交互。
 - Lv1–Lv3 定时升降级、活动统计、保护期/预警/通知/审计，以及可配置等级规则。
-- Active Admin 管理页：可恢复只读维护模式，并创建、列出和撤销一次性注册邀请；原始邀请 token 仅创建时返回一次。
+- Active Admin 管理能力：可恢复只读维护模式，开设公开或成员板块，搜索成员、任命多位管理员、手动调整并锁定信任等级，在主题详情置顶或取消置顶，以及创建、列出和撤销一次性注册邀请；原始邀请 token 仅创建时返回一次。
 - `maintenance_mode` 由服务端中央 middleware 强制：普通成员和版主的业务 mutation 统一返回 `503 / SITE_MAINTENANCE`，安全方法与登录恢复链保持可用，状态正常的 Admin 可绕过并关闭维护。
 
-仍在后续阶段内、不得视为已完成的功能包括：恢复码/账号恢复、完整 Category/Group/ACL 与用户后台、资料与草稿/编辑历史、完整关注通知、徽章、用量仪表板、备份恢复自动化及容量合成测试。详见 [已知限制](#已知限制)。
+仍在后续阶段内、不得视为已完成的功能包括：恢复码/账号恢复、板块编辑与完整 Group/自定义 ACL、用户状态与 session 管理、资料与草稿/编辑历史、完整关注通知、徽章、用量仪表板、备份恢复自动化及容量合成测试。详见 [已知限制](#已知限制)。
 
 ## 架构
 
@@ -115,9 +115,22 @@ Cloudflare 官方资料：[Deploy Button](https://developers.cloudflare.com/work
 
 详细决策见 [`docs/adr/0002-permission-model.md`](./docs/adr/0002-permission-model.md)。
 
+## 管理后台
+
+只有具有有效 session、状态为 `active` 的 Admin 可以调用管理接口；所有修改请求仍须携带 CSRF token。
+
+- `GET /api/admin/users` 按 keyset 游标列出或搜索成员；`PATCH /api/admin/users/:id` 可独立修改角色、信任等级和手动等级锁。任命 Admin 不会隐式改变其信任等级，两者是独立权限维度。
+- 系统允许任命多位 Admin，但不存在更高一级的“超级管理员”。API 与数据库 migration 会共同阻止撤销、停权或删除最后一名 active Admin。
+- 手动修改信任等级默认同时锁定等级，避免下一次定时复核覆盖；解除锁定后，该成员会重新进入自动等级复核。Lv4 始终只允许手工授予。等级变化会写入历史、通知和审计。
+- `GET /api/admin/categories` 列出板块；`POST /api/admin/categories` 开设顶层板块。`open` 表示 ACL 公开读取、登录成员可写；`restricted` 会创建仅登录成员适用的 `see/reply/create` 授权。ACL 与等级门槛始终同时生效。
+- `PATCH /api/topics/:id/pin` 接受显式 `desired` 状态，供 Active Admin 幂等置顶或取消置顶已发布主题。实际变化分别记录 `topic.pin` 或 `topic.unpin` 审计；安全重试不会重复写入审计。
+- 当前界面尚不提供板块编辑/归档、Group ACL、版主板块 scope、用户停权或 session 撤销；这些能力不应通过绕过严格请求 schema 的方式模拟。
+
+更完整的操作说明见 [`docs/admin-guide.md`](./docs/admin-guide.md)。
+
 ## 数据库与 migrations
 
-所有 schema 变更放入 `migrations/`，不得直接修改生产库。当前空库会依次执行 `0001_initial.sql` 与 `0002_invites_admin_list.sql`。发布后不得再修改已经执行过的 migration，而应新增递增版本。
+所有 schema 变更放入 `migrations/`，不得直接修改生产库。当前空库会依次执行 `0001_initial.sql`、`0002_invites_admin_list.sql`、`0003_user_avatars.sql`、`0004_admin_management.sql` 与 `0005_feed_metrics_indexes.sql`。发布后不得再修改已经执行过的 migration，而应新增递增版本。
 
 主要列表必须使用 keyset cursor。发布前对真实查询执行 `EXPLAIN QUERY PLAN`，并把索引证据、预期 `rows_read` 与合成数据结果记录下来。
 
@@ -129,7 +142,7 @@ Cloudflare 官方资料：[Deploy Button](https://developers.cloudflare.com/work
 - FTS 搜索 API 已做权限过滤、安全字面量查询和游标分页；CJK 分词质量调优、搜索限速及接近额度时的降级策略尚未完成。
 - Passkey 注册/登录及客户端强提示已完成；一次性恢复码与账号恢复流程尚未完成。
 - 图片本地优化、R2 许可/finalize/绑定、Public/Private 安全搬运、受控 GET 和孤儿回收已完成；主题创建请求尚无 `Idempotency-Key`，若服务端已创建而响应在网络中丢失，仍存在重复主题风险。
-- Admin 维护恢复、一次性邀请与 staff 审核界面已完成；板块/Group/ACL、用户状态/session、邀请邮箱/域名/多次使用/过期、容量仪表板等完整后台仍未完成。
+- Admin 维护恢复、板块创建、多管理员、手动等级、主题置顶、一次性邀请与 staff 审核界面已完成；板块编辑/归档、Group/自定义 ACL、版主 scope、用户状态/session、邀请邮箱/域名/多次使用/过期、容量仪表板等完整后台仍未完成。
 - 举报、注册/首帖/媒体审核决定、自动隐藏、通知和审计已实现；完整内容编辑、软删除/恢复与申诉产品面尚未完成。
 - Lv1–Lv3 定时升级/降级已实现；处罚历史仍兼容既有 moderation action，尚无独立结构化 sanction 表。
 - 主题/回复/搜索/举报尚未实现全部按等级可配置日限额，高风险发帖尚未接入额外 Turnstile。

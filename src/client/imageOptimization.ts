@@ -44,6 +44,8 @@ export const MAX_ORIGINAL_IMAGE_BYTES = 12 * 1024 * 1024;
 export const MAX_DECODED_IMAGE_PIXELS = 24_000_000;
 export const MAX_MAIN_IMAGE_BYTES = Math.floor(1.5 * 1024 * 1024);
 export const MAX_THUMBNAIL_IMAGE_BYTES = 250 * 1024;
+export const MAX_AVATAR_THUMBNAIL_BYTES = 128 * 1024;
+export const MAX_AVATAR_EDGE = 256;
 
 const ACCEPTED_INPUT_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const MAIN_MAX_EDGE = 2048;
@@ -214,7 +216,11 @@ export function describeImageOptimizationError(error: unknown): string {
   }
 }
 
-export async function optimizeImage(file: File): Promise<OptimizedImage> {
+async function optimizeImageWithThumbnail(
+  file: File,
+  thumbnailMaxEdge: number,
+  thumbnailMaxBytes: number,
+): Promise<OptimizedImage> {
   if (!ACCEPTED_INPUT_TYPES.has(file.type.toLowerCase())) {
     throw new ImageOptimizationError("UNSUPPORTED_TYPE");
   }
@@ -245,7 +251,7 @@ export async function optimizeImage(file: File): Promise<OptimizedImage> {
       : "image/jpeg";
     const [mainWithoutChecksum, thumbnailWithoutChecksum] = await Promise.all([
       encodeVariant(bitmap, MAIN_MAX_EDGE, 0.82, MAX_MAIN_IMAGE_BYTES, contentType),
-      encodeVariant(bitmap, THUMBNAIL_MAX_EDGE, 0.74, MAX_THUMBNAIL_IMAGE_BYTES, contentType),
+      encodeVariant(bitmap, thumbnailMaxEdge, 0.74, thumbnailMaxBytes, contentType),
     ]);
     const [mainChecksum, thumbnailChecksum] = await Promise.all([
       sha256Base64(mainWithoutChecksum.blob),
@@ -264,4 +270,20 @@ export async function optimizeImage(file: File): Promise<OptimizedImage> {
   } finally {
     bitmap.close();
   }
+}
+
+export function optimizeImage(file: File): Promise<OptimizedImage> {
+  return optimizeImageWithThumbnail(
+    file,
+    THUMBNAIL_MAX_EDGE,
+    MAX_THUMBNAIL_IMAGE_BYTES,
+  );
+}
+
+export function optimizeAvatarImage(file: File): Promise<OptimizedImage> {
+  return optimizeImageWithThumbnail(
+    file,
+    MAX_AVATAR_EDGE,
+    MAX_AVATAR_THUMBNAIL_BYTES,
+  );
 }

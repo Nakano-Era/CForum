@@ -6,6 +6,7 @@ export interface TopicDetailAuthor {
   username: string;
   displayName: string;
   trustLevel: TrustLevel;
+  avatarUrl?: string | null;
 }
 
 export interface TopicDetailPost {
@@ -29,6 +30,7 @@ export interface TopicDetailResponse {
     effectiveMinViewLevel: TrustLevel;
     replyCount: number;
     likeCount: number;
+    pinned: boolean;
     bumpedAt: string;
     createdAt: string;
     category: {
@@ -73,6 +75,14 @@ export interface LikeReactionResponse {
   };
 }
 
+export interface TopicPinResponse {
+  topic: {
+    id: string;
+    pinned: boolean;
+  };
+  changed: boolean;
+}
+
 export async function getTopicDetail(
   topicId: string,
   signal?: AbortSignal,
@@ -115,6 +125,24 @@ export async function setLikeReaction(
         "X-CSRF-Token": csrfToken,
       },
       body: JSON.stringify({ type: "like", desired }),
+    },
+  );
+}
+
+export async function setTopicPinned(
+  topicId: string,
+  desired: boolean,
+  csrfToken: string,
+): Promise<TopicPinResponse> {
+  return requestJson<TopicPinResponse>(
+    `/api/topics/${encodeURIComponent(topicId)}/pin`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken,
+      },
+      body: JSON.stringify({ desired }),
     },
   );
 }

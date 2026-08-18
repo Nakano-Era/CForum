@@ -27,7 +27,45 @@ Active Admin 可从顶栏“管理”进入邀请工作台：
 
 Lv0 前若干主题与回复的审核数量分别由 `lv0_first_topics_review_count` 和 `lv0_first_replies_review_count` 控制；设为 `0` 表示关闭。板块自身的强制审核仍独立生效。
 
-Active Admin 可通过 `GET /api/admin/settings` 查看基础设置，并以带会话 CSRF 请求头的 `PATCH /api/admin/settings` 在线调整注册模式、注册冻结、邀请制审批、维护模式及上述两个 Lv0 阈值。该接口使用固定字段白名单并写入 `audit_logs`；版主和非 active 管理员无权调用。当前管理页已提供维护开关与邀请管理，其余设置的完整图形化后台仍在后续阶段。
+Active Admin 可通过 `GET /api/admin/settings` 查看基础设置，并以带会话 CSRF 请求头的 `PATCH /api/admin/settings` 在线调整注册模式、注册冻结、邀请制审批、维护模式及上述两个 Lv0 阈值。该接口使用固定字段白名单并写入 `audit_logs`；版主和非 active 管理员无权调用。当前管理页还提供板块创建、多管理员、成员等级与邀请管理；其余设置的完整图形化后台仍在后续阶段。
+
+## 多管理员与成员等级
+
+Active Admin 可在“成员与权限”中按用户名、昵称或邮箱搜索成员。对应接口为 `GET /api/admin/users`，使用 `q` 与 keyset `cursor`；修改使用带 CSRF 的 `PATCH /api/admin/users/:id`，请求可以只包含 `role`、`trustLevel`、`levelLocked` 中需要变化的字段。
+
+- 把状态正常的成员角色设为 `admin` 后，该成员下一次请求便拥有完整 Admin 权限。系统没有高于 Admin 的超级管理员；Bootstrap 只负责建立第一位管理员，不形成永久“站主”特权。
+- 角色与信任等级彼此独立。任命 Admin 不会自动把成员改为 Lv4；Active Admin 的全站管理能力来自角色，普通内容权限仍保留清晰的等级记录。
+- 管理页不允许管理员更改自己的角色。要撤销某位管理员，请先由另一位 Active Admin 登录操作。
+- 系统始终要求至少保留一名 `role=admin` 且 `status=active` 的账号。撤销最后一名有效管理员时 API 返回 `409 / LAST_ACTIVE_ADMIN_REQUIRED`；数据库 trigger 也会阻止其他代码路径停权、降级角色或删除最后一名有效管理员。任何非 active 的 Admin 都不计入该保护数量。
+- 选择新的信任等级时，管理页会同时启用“保持手动等级”。即使调用 API 时只提交 `trustLevel`，服务端也默认设置 `level_locked=1`，避免定时复核立即覆盖人工决定。
+- 取消“保持手动等级”后，Lv1–Lv3 成员会重新进入定时自动升降级队列；实际变化取决于活动指标与当前规则，不保证立刻改变。Lv4 按规则始终只允许手工授予，管理页不会把它显示为可自动复核。
+- 人工等级变化会写入 `user_level_history`、站内通知和 `audit_logs`。降级仍会触发作者高等级主题的只读保护，不会绕过既有等级与 ACL 不变量。
+
+角色设为 `moderator` 本身不会授予任何板块治理范围；仍必须存在精确的 `moderator_category_scopes`。当前管理页尚未提供 scope 分配界面。
+
+## 开设板块
+
+Active Admin 可在“板块管理”中创建顶层板块；对应接口为 `GET /api/admin/categories` 与带 CSRF 的 `POST /api/admin/categories`。
+
+- `slug` 长度为 2–60，只允许小写英文、数字以及分隔单词的单个连字符，并且全站唯一。
+- `aclMode=open` 表示 ACL 允许游客读取、登录账号发主题与回复；等级门槛仍会继续应用，因此阅读门槛高于 Lv0 时并不会真的向游客公开。
+- `aclMode=restricted` 会自动写入 `authenticated` 的 `see`、`reply`、`create` 三项授权，形成仅登录成员板块；它不是自定义 Group ACL。
+- `minCreateLevel`、`minReplyLevel` 与 `allowedTopicMinLevelMax` 都不能低于 `minViewLevel`。管理页在提高阅读门槛时会同步抬高这些冲突值，服务端仍会再次校验。
+- `allowedTopicMinLevelMax` 限制成员在该板块创建主题时可选择的最高可见等级；`allowImages=false` 会禁止该板块的新主题使用图片上传。
+- 创建使用 D1 batch 同步写入板块、必要 ACL 与 `category.create` 审计。重复 slug 返回 `409 / CATEGORY_SLUG_TAKEN`，不会留下半成品或审计记录。
+
+当前管理页尚不支持修改、排序、归档或删除既有板块，也不支持 Group ACL 与子板块；开设前应确认名称、slug 和权限门槛。
+
+## 主题置顶
+
+Active Admin 打开主题详情后，可以使用“置顶主题”或“取消置顶”按钮调整首页综合信息流。对应接口为带会话 CSRF 请求头的 `PATCH /api/topics/:id/pin`，请求体必须显式提供 `desired: true` 或 `desired: false`。
+
+- 置顶复用主题的 `pinned_at` 字段；非空时综合信息流优先展示该主题，取消后恢复按最近活动时间排序。操作不会修改主题正文、`bumped_at`、可见等级、板块 ACL 或锁定状态。
+- 只有具备有效 session 且状态为 `active` 的 Admin 可以调用。Member、Moderator、非 active Admin 与无 session 请求均不能操作；全局 Origin 与 CSRF 校验仍先于业务写入生效。
+- 只有已批准且状态为 `open`、`locked` 或 `archived` 的主题可调整。不存在、待审或已删除主题统一返回 404，不会产生审计记录。
+- 接口按目标状态幂等：重复提交相同 `desired` 会返回当前状态及 `changed=false`，不会刷新 `pinned_at`、`updated_at` 或重复写审计。
+- 实际置顶和取消置顶分别写入 `audit_logs` 的 `topic.pin` 与 `topic.unpin`，同时保存变更前后的 `pinned` 布尔状态、操作者、板块、请求 ID 与发生时间。
+- 成功后主题详情会立即显示新状态并提示首页排序已更新；客户端同时刷新 Feed，使返回社区时无需手工重新载入。
 
 ## 只读维护
 
@@ -49,7 +87,7 @@ Active Admin 可通过 `GET /api/admin/settings` 查看基础设置，并以带�
 
 ## 版主授权
 
-版主必须逐板块写入 `moderator_category_scopes`，不自动继承子板块。授权前确认其只能处理该板块内容、附件、举报与审核项；注册、角色、等级、全站处罚、ACL 和站点设置仅 Admin 操作。
+版主必须逐板块写入 `moderator_category_scopes`，不自动继承子板块；只把成员角色改成 `moderator` 不会自动产生 scope。当前管理页尚未提供 scope 分配。授权后仍应确认其只能处理该板块内容、附件、举报与审核项；注册、角色、等级、全站处罚、ACL 和站点设置仅 Admin 操作。
 
 ## 媒体与生命周期
 

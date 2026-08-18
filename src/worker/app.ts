@@ -14,6 +14,8 @@ import notificationRoutes from "@/worker/routes/notifications";
 import activityRoutes from "@/worker/routes/activity";
 import adminTrustRoutes from "@/worker/routes/admin-trust";
 import adminInviteRoutes from "@/worker/routes/admin-invites";
+import profileRoutes from "@/worker/routes/profile";
+import adminManagementRoutes from "@/worker/routes/admin-management";
 import { enforceMaintenanceMode } from "@/worker/middleware/maintenance";
 
 const app = new Hono<AppEnv>();
@@ -88,6 +90,8 @@ app.route("/api", notificationRoutes);
 app.route("/api", activityRoutes);
 app.route("/api", adminTrustRoutes);
 app.route("/api", adminInviteRoutes);
+app.route("/api", profileRoutes);
+app.route("/api", adminManagementRoutes);
 
 app.notFound((context) =>
   context.json({ error: { code: "NOT_FOUND" } }, 404),

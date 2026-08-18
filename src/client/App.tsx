@@ -21,6 +21,7 @@ import AdminWorkspace from "./AdminWorkspace";
 import ComposeDialog from "./ComposeDialog";
 import NotificationPanel from "./NotificationPanel";
 import PasskeyPrompt from "./PasskeyPrompt";
+import ProfileDialog from "./ProfileDialog";
 import ReportDialog from "./ReportDialog";
 import ReviewWorkspace from "./ReviewWorkspace";
 import TopicDetail from "./TopicDetail";
@@ -43,13 +44,15 @@ import {
   type TopicVisibility,
 } from "./feed";
 import { setPostBookmark } from "./forum";
+import { shouldDismissDialogOnEscape } from "./dialogDismissal";
 
 type Theme = "light" | "dark";
 type FeedStatus = "ready" | "loading" | "error";
 type InstallationStatus = "checking" | "required" | "installed" | "error";
 type LevelFilter = "all" | "0" | "1" | "2" | "3" | "4";
-type ActiveDialog = "login" | "compose" | "report" | null;
+type ActiveDialog = "login" | "compose" | "profile" | "report" | null;
 type ActiveView = "feed" | "review" | "admin" | "topic";
+type CommunitySection = "categories" | "community-pulse" | "community-guide";
 
 type AppRoute =
   | { view: "feed" }
@@ -73,6 +76,15 @@ function routeFromLocation(): AppRoute {
   } catch {
     return { view: "feed" };
   }
+}
+
+function communitySectionFromHash(hash: string): CommunitySection | null {
+  const section = hash.startsWith("#") ? hash.slice(1) : hash;
+  return section === "categories" ||
+    section === "community-pulse" ||
+    section === "community-guide"
+    ? section
+    : null;
 }
 
 function isPlainLeftClick(event: { button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }): boolean {
@@ -192,7 +204,14 @@ export default function App() {
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
   const [dialog, setDialog] = useState<ActiveDialog>(null);
+  const [profileBusy, setProfileBusy] = useState(false);
   const [activeView, setActiveView] = useState<ActiveView>("feed");
+  const [pendingSection, setPendingSection] = useState<CommunitySection | null>(
+    () =>
+      typeof window === "undefined"
+        ? null
+        : communitySectionFromHash(window.location.hash),
+  );
   const [reportTopic, setReportTopic] = useState<FeedTopic | null>(null);
   const [showMobileFilters, setShowMobileFilters] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -213,6 +232,7 @@ export default function App() {
     const handlePopState = () => {
       const nextRoute = routeFromLocation();
       setRoute(nextRoute);
+      setPendingSection(communitySectionFromHash(window.location.hash));
       setActiveView(
         nextRoute.view === "topic"
           ? "feed"
@@ -274,7 +294,10 @@ export default function App() {
   useEffect(() => {
     if (!dialog) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && dialog !== "compose") {
+      if (
+        event.key === "Escape" &&
+        shouldDismissDialogOnEscape(dialog, profileBusy)
+      ) {
         setDialog(null);
         if (dialog === "report") setReportTopic(null);
       }
@@ -285,7 +308,7 @@ export default function App() {
       document.body.classList.remove("modal-open");
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [dialog]);
+  }, [dialog, profileBusy]);
 
   useEffect(() => {
     if (!toast) return;
@@ -354,6 +377,33 @@ export default function App() {
   }, [activeTab, category, debouncedQuery, installationStatus, level, refreshVersion]);
 
   useEffect(() => () => loadMoreControllerRef.current?.abort(), []);
+
+  useEffect(() => {
+    if (
+      !pendingSection ||
+      route.view !== "feed" ||
+      activeView !== "feed" ||
+      !feed
+    ) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(pendingSection);
+      if (!target) return;
+      window.history.replaceState(
+        { ...window.history.state, cforumView: "feed" },
+        "",
+        `/#${pendingSection}`,
+      );
+      target.focus({ preventScroll: true });
+      const top = target.getBoundingClientRect().top + window.scrollY - 84;
+      window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+      setPendingSection(null);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeView, feed, pendingSection, route.view]);
 
   const activeTabMeta = TAB_OPTIONS.find((tab) => tab.id === activeTab) ?? TAB_OPTIONS[0];
   const hasFilters = category !== "all" || level !== "all" || query.trim() !== "";
@@ -516,6 +566,11 @@ export default function App() {
     setActiveView("feed");
     setShowNotifications(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const openCommunitySection = (section: CommunitySection) => {
+    setPendingSection(section);
+    navigateToFeed();
   };
 
   const openStaffWorkspace = (view: "review" | "admin") => {
@@ -686,6 +741,7 @@ export default function App() {
       <TopBar
         activeView={shellView}
         activeTheme={theme}
+        avatarUrl={authUser?.avatarUrl ?? null}
         isAdmin={isAdmin}
         isStaff={isStaff}
         notificationCount={notificationCount}
@@ -695,6 +751,8 @@ export default function App() {
         onOpenCommunity={() => {
           navigateToFeed();
         }}
+        onOpenCommunitySection={openCommunitySection}
+        onOpenProfile={() => { setShowNotifications(false); setProfileBusy(false); setDialog("profile"); }}
         onOpenAdmin={() => openStaffWorkspace("admin")}
         onOpenReview={() => openStaffWorkspace("review")}
         onSearch={setQuery}
@@ -736,6 +794,7 @@ export default function App() {
           onBack={navigateBackFromTopic}
           onLogin={() => { setShowNotifications(false); setDialog("login"); }}
           onOpenCategory={openCategory}
+          onPinChanged={refreshFeed}
           onReplyCreated={(postId) => replaceTopicHash(route.topicId, postId)}
           topicId={route.topicId}
         />
@@ -867,8 +926,23 @@ export default function App() {
       ) : activeView === "admin" ? isAdmin ? (
         <AdminWorkspace
           csrfToken={csrfTokenRef.current}
+          currentUserId={authUser.id}
           initialMaintenanceMode={siteConfig.maintenanceMode}
           onAuthenticationRequired={() => authenticationRequired("登录状态已失效，请重新登录后继续管理")}
+          onCategoryCreated={refreshFeed}
+          onCurrentUserUpdated={(user) => {
+            setAuthUser((current) =>
+              current?.id === user.id
+                ? { ...current, trustLevel: user.trustLevel }
+                : current,
+            );
+            setViewer((current) =>
+              current?.id === user.id
+                ? { ...current, trustLevel: user.trustLevel }
+                : current,
+            );
+            refreshFeed();
+          }}
           onExit={navigateToFeed}
           onMaintenanceModeChange={(enabled) => {
             setSiteConfig((current) => ({ ...current, maintenanceMode: enabled }));
@@ -907,6 +981,7 @@ export default function App() {
       <MobileDock
         activeView={shellView}
         activeTab={activeTab}
+        avatarUrl={authUser?.avatarUrl ?? null}
         isAdmin={isAdmin}
         isStaff={isStaff}
         notificationCount={notificationCount}
@@ -914,7 +989,9 @@ export default function App() {
         onCompose={openCompose}
         onLogin={() => { setShowNotifications(false); setDialog("login"); }}
         onOpenNotifications={toggleNotifications}
+        onOpenProfile={() => { setShowNotifications(false); setProfileBusy(false); setDialog("profile"); }}
         onOpenAdmin={() => openStaffWorkspace("admin")}
+        onOpenCommunitySection={openCommunitySection}
         onOpenReview={() => openStaffWorkspace("review")}
         onSelectTab={selectTab}
         viewer={viewer}
@@ -932,6 +1009,20 @@ export default function App() {
           }}
           siteConfig={siteConfig}
           theme={theme}
+        />
+      )}
+      {dialog === "profile" && authUser && (
+        <ProfileDialog
+          csrfToken={csrfTokenRef.current}
+          onAuthenticationRequired={() => authenticationRequired("登录状态已失效，请重新登录后设置头像")}
+          onBusyChange={setProfileBusy}
+          onClose={() => setDialog(null)}
+          onUpdated={(avatarUrl) => {
+            setAuthUser((current) => current ? { ...current, avatarUrl } : current);
+            setDialog(null);
+            setToast(avatarUrl ? "头像已更新" : "头像已移除");
+          }}
+          user={authUser}
         />
       )}
       {dialog === "compose" && authUser && (
@@ -1285,6 +1376,7 @@ function InstallWizard({ theme, onInstalled, onToggleTheme }: InstallWizardProps
 interface TopBarProps {
   activeView: ActiveView;
   activeTheme: Theme;
+  avatarUrl: string | null;
   isAdmin: boolean;
   isStaff: boolean;
   notificationCount: number;
@@ -1296,6 +1388,8 @@ interface TopBarProps {
   onLogin: () => void;
   onOpenAdmin: () => void;
   onOpenCommunity: () => void;
+  onOpenCommunitySection: (section: CommunitySection) => void;
+  onOpenProfile: () => void;
   onOpenReview: () => void;
   onSearch: (value: string) => void;
   onToggleTheme: () => void;
@@ -1305,6 +1399,7 @@ interface TopBarProps {
 function TopBar({
   activeView,
   activeTheme,
+  avatarUrl,
   isAdmin,
   isStaff,
   notificationCount,
@@ -1316,6 +1411,8 @@ function TopBar({
   onLogin,
   onOpenAdmin,
   onOpenCommunity,
+  onOpenCommunitySection,
+  onOpenProfile,
   onOpenReview,
   onSearch,
   onToggleTheme,
@@ -1346,9 +1443,30 @@ function TopBar({
             onClick={onOpenCommunity}
             type="button"
           >社区</button>
-          <a href="#categories">板块</a>
-          <a href="#community-pulse">成员</a>
-          <a href="#community-guide">公约</a>
+          <a
+            href="/#categories"
+            onClick={(event) => {
+              if (!isPlainLeftClick(event)) return;
+              event.preventDefault();
+              onOpenCommunitySection("categories");
+            }}
+          >板块</a>
+          <a
+            href="/#community-pulse"
+            onClick={(event) => {
+              if (!isPlainLeftClick(event)) return;
+              event.preventDefault();
+              onOpenCommunitySection("community-pulse");
+            }}
+          >成员</a>
+          <a
+            href="/#community-guide"
+            onClick={(event) => {
+              if (!isPlainLeftClick(event)) return;
+              event.preventDefault();
+              onOpenCommunitySection("community-guide");
+            }}
+          >公约</a>
           {isStaff && (
             <button
               aria-current={activeView === "review" ? "page" : undefined}
@@ -1400,11 +1518,11 @@ function TopBar({
             {notificationCount > 0 && <span className="notification-dot">{notificationCount}</span>}
           </button>
           {viewer ? (
-            <div className="viewer-action viewer-summary" title="个人页面尚未开放">
-              <span aria-hidden="true">{[...viewer.displayName][0] ?? "我"}</span>
+            <button aria-label="打开个人设置" className="viewer-action viewer-summary" onClick={onOpenProfile} type="button">
+              <span aria-hidden="true">{avatarUrl ? <img alt="" src={avatarUrl} /> : ([...viewer.displayName][0] ?? "我")}</span>
               <strong>{viewer.displayName}</strong>
               <small>Lv{viewer.trustLevel}</small>
-            </div>
+            </button>
           ) : (
             <button className="button button-quiet login-action" onClick={onLogin} type="button">
               登录
@@ -1633,7 +1751,7 @@ function TopicCard({
         <footer className="topic-footer">
           <div className="author" title="个人页面尚未开放">
             <span className={`avatar avatar-${topic.author.avatarTone}`} aria-hidden="true">
-              {topic.author.initials}
+              {topic.author.avatarUrl ? <img alt="" src={topic.author.avatarUrl} /> : topic.author.initials}
             </span>
             <span>
               <strong>{topic.author.displayName}</strong>
@@ -1792,7 +1910,7 @@ function Sidebar({
 }) {
   return (
     <aside className="sidebar" aria-label="社区概览">
-      <section className="sidebar-panel categories-panel" id="categories">
+      <section className="sidebar-panel categories-panel" id="categories" tabIndex={-1}>
         <div className="panel-heading">
           <h2>浏览板块</h2>
           <button onClick={() => onOpenCategory("all")} type="button">全部 <span aria-hidden="true">→</span></button>
@@ -1816,7 +1934,7 @@ function Sidebar({
         </ul>
       </section>
 
-      <section className="sidebar-panel pulse-panel" id="community-pulse">
+      <section className="sidebar-panel pulse-panel" id="community-pulse" tabIndex={-1}>
         <div className="panel-heading">
           <h2>此刻的社区</h2>
           <span className="live-label"><i /> LIVE</span>
@@ -1837,7 +1955,7 @@ function Sidebar({
         </div>
       </section>
 
-      <section className="sidebar-panel guide-panel" id="community-guide">
+      <section className="sidebar-panel guide-panel" id="community-guide" tabIndex={-1}>
         <p className="eyebrow">第一次来？</p>
         <h2>从一段真诚的自我介绍开始</h2>
         <p>说说你正在学习、制作或反复思考的事。这里不需要完美答案。</p>
@@ -1848,7 +1966,7 @@ function Sidebar({
 
       <footer className="sidebar-footer">
         <a href="/about">关于</a>
-        <a href="/guidelines">社区公约</a>
+        <a href="/#community-guide">社区公约</a>
         <a href="/privacy">隐私</a>
         <a href="/contact">联系</a>
         <span>© 2026 {siteName}</span>
@@ -1890,6 +2008,7 @@ function SidebarUnavailable({ onRetry }: { onRetry: () => void }) {
 interface MobileDockProps {
   activeView: ActiveView;
   activeTab: FeedTab;
+  avatarUrl: string | null;
   isAdmin: boolean;
   isStaff: boolean;
   notificationCount: number;
@@ -1898,7 +2017,9 @@ interface MobileDockProps {
   onCompose: () => void;
   onLogin: () => void;
   onOpenAdmin: () => void;
+  onOpenCommunitySection: (section: CommunitySection) => void;
   onOpenNotifications: () => void;
+  onOpenProfile: () => void;
   onOpenReview: () => void;
   viewer: FeedResponse["viewer"];
 }
@@ -1906,6 +2027,7 @@ interface MobileDockProps {
 function MobileDock({
   activeView,
   activeTab,
+  avatarUrl,
   isAdmin,
   isStaff,
   notificationCount,
@@ -1914,51 +2036,125 @@ function MobileDock({
   onCompose,
   onLogin,
   onOpenAdmin,
+  onOpenCommunitySection,
   onOpenNotifications,
+  onOpenProfile,
   onOpenReview,
   viewer,
 }: MobileDockProps) {
+  const [communityNavOpen, setCommunityNavOpen] = useState(false);
+  const communityNavButtonRef = useRef<HTMLButtonElement>(null);
+  const communityNavMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!communityNavOpen) return;
+
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!(event.target instanceof Node)) return;
+      if (
+        communityNavButtonRef.current?.contains(event.target) ||
+        communityNavMenuRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+      setCommunityNavOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setCommunityNavOpen(false);
+      communityNavButtonRef.current?.focus();
+    };
+
+    window.addEventListener("pointerdown", closeOnOutsidePress);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsidePress);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [communityNavOpen]);
+
+  const runAndClose = (action: () => void) => {
+    setCommunityNavOpen(false);
+    action();
+  };
+
+  const openSection = (section: CommunitySection) => {
+    setCommunityNavOpen(false);
+    onOpenCommunitySection(section);
+  };
+
   return (
-    <nav className={isAdmin ? "mobile-dock has-staff has-admin" : isStaff ? "mobile-dock has-staff" : "mobile-dock"} aria-label="移动端主导航">
-      <button className={activeView === "feed" && activeTab === "all" ? "is-active" : ""} onClick={() => onSelectTab("all")} type="button">
-        <span aria-hidden="true">⌂</span><small>首页</small>
-      </button>
-      <button className={activeView === "feed" && activeTab === "latest" ? "is-active" : ""} onClick={() => onSelectTab("latest")} type="button">
-        <span aria-hidden="true">新</span><small>最新</small>
-      </button>
-      <button className="dock-compose" onClick={onCompose} type="button">
-        <span aria-hidden="true">＋</span><small>发布</small>
-      </button>
-      {isStaff && (
-        <button className={activeView === "review" ? "is-active" : ""} onClick={onOpenReview} type="button">
-          <span aria-hidden="true">审</span><small>审核</small>
+    <>
+      <nav className={isAdmin ? "mobile-dock has-staff has-admin" : isStaff ? "mobile-dock has-staff" : "mobile-dock"} aria-label="移动端主导航">
+        <button className={activeView === "feed" && activeTab === "all" ? "is-active" : ""} onClick={() => runAndClose(() => onSelectTab("all"))} type="button">
+          <span aria-hidden="true">⌂</span><small>首页</small>
         </button>
-      )}
-      {isAdmin && (
-        <button className={activeView === "admin" ? "is-active" : ""} onClick={onOpenAdmin} type="button">
-          <span aria-hidden="true">管</span><small>管理</small>
+        <button
+          aria-controls="mobile-community-menu"
+          aria-expanded={communityNavOpen}
+          aria-haspopup="menu"
+          aria-label="打开社区导航"
+          className={communityNavOpen ? "is-active" : ""}
+          onClick={() => setCommunityNavOpen((open) => !open)}
+          ref={communityNavButtonRef}
+          type="button"
+        >
+          <span aria-hidden="true">览</span><small>社区</small>
         </button>
-      )}
-      <button
-        aria-controls="notification-panel"
-        aria-expanded={notificationsOpen}
-        aria-haspopup="dialog"
-        aria-label={`${notificationCount} 条未读通知`}
-        className={notificationsOpen ? "is-active" : ""}
-        onClick={onOpenNotifications}
-        type="button"
-      >
-        <span className="dock-notification" aria-hidden="true">铃{notificationCount > 0 && <b>{notificationCount}</b>}</span><small>通知</small>
-      </button>
-      {viewer ? (
-        <span className="dock-viewer" title="个人页面尚未开放">
-          <span aria-hidden="true">{[...viewer.displayName][0] ?? "我"}</span><small>我的</small>
-        </span>
-      ) : (
-        <button onClick={onLogin} type="button">
-          <span aria-hidden="true">我</span><small>登录</small>
+        <button className="dock-compose" onClick={() => runAndClose(onCompose)} type="button">
+          <span aria-hidden="true">＋</span><small>发布</small>
         </button>
+        {isStaff && (
+          <button className={activeView === "review" ? "is-active" : ""} onClick={() => runAndClose(onOpenReview)} type="button">
+            <span aria-hidden="true">审</span><small>审核</small>
+          </button>
+        )}
+        {isAdmin && (
+          <button className={activeView === "admin" ? "is-active" : ""} onClick={() => runAndClose(onOpenAdmin)} type="button">
+            <span aria-hidden="true">管</span><small>管理</small>
+          </button>
+        )}
+        <button
+          aria-controls="notification-panel"
+          aria-expanded={notificationsOpen}
+          aria-haspopup="dialog"
+          aria-label={`${notificationCount} 条未读通知`}
+          className={notificationsOpen ? "is-active" : ""}
+          onClick={() => runAndClose(onOpenNotifications)}
+          type="button"
+        >
+          <span className="dock-notification" aria-hidden="true">铃{notificationCount > 0 && <b>{notificationCount}</b>}</span><small>通知</small>
+        </button>
+        {viewer ? (
+          <button className="dock-viewer" onClick={() => runAndClose(onOpenProfile)} type="button">
+            <span aria-hidden="true">{avatarUrl ? <img alt="" src={avatarUrl} /> : ([...viewer.displayName][0] ?? "我")}</span><small>我的</small>
+          </button>
+        ) : (
+          <button onClick={() => runAndClose(onLogin)} type="button">
+            <span aria-hidden="true">我</span><small>登录</small>
+          </button>
+        )}
+      </nav>
+
+      {communityNavOpen && (
+        <div
+          aria-label="社区导航"
+          className="mobile-community-menu"
+          id="mobile-community-menu"
+          ref={communityNavMenuRef}
+          role="menu"
+        >
+          <button onClick={() => openSection("categories")} role="menuitem" type="button">
+            <span aria-hidden="true">板</span><strong>板块</strong><small>浏览讨论分区</small>
+          </button>
+          <button onClick={() => openSection("community-pulse")} role="menuitem" type="button">
+            <span aria-hidden="true">人</span><strong>成员</strong><small>查看社区此刻</small>
+          </button>
+          <button onClick={() => openSection("community-guide")} role="menuitem" type="button">
+            <span aria-hidden="true">约</span><strong>公约</strong><small>阅读交流原则</small>
+          </button>
+        </div>
       )}
-    </nav>
+    </>
   );
 }

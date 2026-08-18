@@ -12,6 +12,7 @@ interface CapturedQuery {
 function feedDatabase(captured: CapturedQuery[]): D1Database {
   const feedRow = {
     id: "topic-1",
+    first_post_id: "post-1",
     slug: "topic-1",
     title: "One topic",
     excerpt: "Excerpt",
@@ -52,6 +53,19 @@ function feedDatabase(captured: CapturedQuery[]): D1Database {
         },
         async all() {
           captured.push({ sql, bindings });
+          if (sql.includes("AS topic_count")) {
+            return {
+              success: true,
+              results: [
+                {
+                  category_id: "category-1",
+                  topic_count: 7,
+                  unread_count: 2,
+                },
+              ],
+              meta: {},
+            };
+          }
           // Model two post-level bookmarks in the same topic. The former JOIN
           // shape would duplicate the topic row; EXISTS keeps one card.
           const results = sql.includes("LEFT JOIN bookmarks")
@@ -61,7 +75,19 @@ function feedDatabase(captured: CapturedQuery[]): D1Database {
         },
         async first() {
           captured.push({ sql, bindings });
-          return sql.includes("FROM notifications") ? { count: 0 } : null;
+          if (sql.includes("FROM notifications")) return { count: 0 };
+          if (sql.includes("AS members_online")) {
+            return {
+              members_online: 3,
+              new_topics_today: 4,
+              replies_today: 12,
+              active_members_this_week: 9,
+            };
+          }
+          return null;
+        },
+        async run() {
+          return { success: true, results: [], meta: { changes: 1 } };
         },
       };
       return statement;
@@ -136,11 +162,33 @@ describe("feed bookmark projection", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       topics: Array<{ id: string; bookmarked: boolean }>;
+      pulse: {
+        membersOnline: number;
+        newTopicsToday: number;
+        repliesToday: number;
+        activeMembersThisWeek: number;
+      };
+      categories: Array<{
+        id: string;
+        topicCount: number;
+        unreadCount: number;
+      }>;
     };
     expect(body.topics).toHaveLength(1);
     expect(body.topics[0]).toMatchObject({
       id: "topic-1",
       bookmarked: true,
+    });
+    expect(body.pulse).toEqual({
+      membersOnline: 3,
+      newTopicsToday: 4,
+      repliesToday: 12,
+      activeMembersThisWeek: 9,
+    });
+    expect(body.categories[0]).toMatchObject({
+      id: "category-1",
+      topicCount: 7,
+      unreadCount: 2,
     });
 
     const feedQuery = captured[0];
@@ -153,5 +201,34 @@ describe("feed bookmark projection", () => {
       "user-1",
       "user-1",
     ]);
+  });
+
+  it.each([
+    ["latest", "t.bumped_at DESC, t.id DESC"],
+    ["hot", "t.hot_score DESC, t.id DESC"],
+    ["following", "t.bumped_at DESC, t.id DESC"],
+    ["unread", "t.bumped_at DESC, t.id DESC"],
+  ])("builds a valid order for the %s tab", async (tab, expectedOrder) => {
+    const captured: CapturedQuery[] = [];
+    const app = new Hono<AppEnv>();
+    app.use("*", async (context, next) => {
+      context.set("requestId", "request-1");
+      context.set("identity", identity);
+      await next();
+    });
+    app.route("/", forumRoutes);
+
+    const response = await app.request(
+      `https://forum.example.com/feed?tab=${tab}`,
+      undefined,
+      bindings(feedDatabase(captured)),
+    );
+
+    expect(response.status).toBe(200);
+    const feedQuery = captured.find((query) =>
+      query.sql.includes("JOIN posts first_post"),
+    );
+    expect(feedQuery?.sql).toContain(`ORDER BY ${expectedOrder}`);
+    expect(feedQuery?.sql).not.toContain("ORDER BY 0");
   });
 });

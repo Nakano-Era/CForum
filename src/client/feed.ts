@@ -36,6 +36,7 @@ export interface TopicAuthor {
   handle: string;
   initials: string;
   avatarTone: "coral" | "moss" | "blue" | "gold" | "plum";
+  avatarUrl?: string | null;
   trustLevel: TrustLevel;
 }
 

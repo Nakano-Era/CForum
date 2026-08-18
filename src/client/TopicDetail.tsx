@@ -8,6 +8,7 @@ import {
   createReply,
   getTopicDetail,
   setLikeReaction,
+  setTopicPinned,
   type TopicDetailPost,
   type TopicDetailResponse,
 } from "./topic";
@@ -24,6 +25,7 @@ interface TopicDetailProps {
   onBack: () => void;
   onLogin: () => void;
   onOpenCategory: (categorySlug: string) => void;
+  onPinChanged: () => void;
   onReplyCreated: (postId: string) => void;
 }
 
@@ -78,6 +80,7 @@ export default function TopicDetail({
   onBack,
   onLogin,
   onOpenCategory,
+  onPinChanged,
   onReplyCreated,
 }: TopicDetailProps) {
   const [detail, setDetail] = useState<TopicDetailResponse | null>(null);
@@ -85,8 +88,11 @@ export default function TopicDetail({
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [loadedVersion, setLoadedVersion] = useState(0);
   const [likeBusy, setLikeBusy] = useState<Set<string>>(() => new Set());
+  const [pinBusy, setPinBusy] = useState(false);
   const [replyBody, setReplyBody] = useState("");
   const maintenanceReadOnly = maintenanceMode && authUser?.role !== "admin";
+  const isActiveAdmin =
+    authUser?.role === "admin" && authUser.status === "active";
   const [replyBusy, setReplyBusy] = useState(false);
   const [replyError, setReplyError] = useState("");
   const [replyOutcome, setReplyOutcome] = useState("");
@@ -102,6 +108,7 @@ export default function TopicDetail({
     setReplyOutcome("");
     setNotice("");
     setLikeBusy(new Set());
+    setPinBusy(false);
   }, [topicId]);
 
   useEffect(() => {
@@ -227,6 +234,62 @@ export default function TopicDetail({
     }
   };
 
+  const togglePinned = async () => {
+    if (!detail || pinBusy || !isActiveAdmin) return;
+    if (!csrfToken) {
+      setNotice("会话安全令牌不可用，请刷新页面后重试");
+      return;
+    }
+
+    const desired = !detail.topic.pinned;
+    setPinBusy(true);
+    try {
+      const response = await setTopicPinned(topicId, desired, csrfToken);
+      if (topicIdRef.current !== topicId) return;
+      if (response.topic.id !== topicId) {
+        throw new Error("topic_pin_response_mismatch");
+      }
+      setDetail((current) =>
+        current && current.topic.id === topicId
+          ? {
+              ...current,
+              topic: { ...current.topic, pinned: response.topic.pinned },
+            }
+          : current,
+      );
+      onPinChanged();
+      setNotice(
+        response.topic.pinned
+          ? response.changed
+            ? "主题已置顶，首页排序已更新"
+            : "主题已经是置顶状态"
+          : response.changed
+            ? "已取消置顶，首页排序已更新"
+            : "主题已经不是置顶状态",
+      );
+    } catch (error) {
+      if (topicIdRef.current !== topicId) return;
+      if (isSiteMaintenanceError(error)) {
+        setNotice("站点正在维护，置顶状态没有更新");
+      } else if (error instanceof ApiRequestError && error.status === 401) {
+        onAuthenticationRequired("登录状态已失效，请重新登录后管理主题");
+      } else if (
+        error instanceof ApiRequestError &&
+        error.code === "INVALID_CSRF_TOKEN"
+      ) {
+        setNotice("会话安全令牌已失效，请刷新页面后重试");
+      } else if (error instanceof ApiRequestError && error.status === 403) {
+        setNotice("只有状态正常的管理员可以置顶主题");
+      } else if (error instanceof ApiRequestError && error.status === 404) {
+        setNotice("这篇主题已不存在或当前状态不能置顶");
+      } else {
+        setNotice("置顶状态更新失败，请稍后再试");
+      }
+    } finally {
+      setPinBusy(false);
+    }
+  };
+
   const submitReply = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!detail || replyBusy) return;
@@ -329,6 +392,7 @@ export default function TopicDetail({
             {detail.topic.category.name}
           </button>
           {detail.topic.status !== "open" && <span className="status-chip lock-chip">{detail.topic.status === "locked" ? "已锁定" : "只读"}</span>}
+          {detail.topic.pinned && <span className="status-chip pinned-chip">置顶</span>}
           {detail.topic.effectiveMinViewLevel > 0 && <span className="status-chip level-chip">Lv{detail.topic.effectiveMinViewLevel}+ 可见</span>}
         </div>
         <h1 ref={headingRef} tabIndex={-1}>{detail.topic.title}</h1>
@@ -343,6 +407,23 @@ export default function TopicDetail({
             {detail.tags.map((tag) => <span key={tag.slug}>#{tag.name}</span>)}
           </div>
         )}
+        {isActiveAdmin && (
+          <div className="topic-detail-admin-actions">
+            <button
+              aria-busy={pinBusy}
+              className="button button-secondary"
+              disabled={pinBusy}
+              onClick={() => void togglePinned()}
+              type="button"
+            >
+              {pinBusy
+                ? "正在更新…"
+                : detail.topic.pinned
+                  ? "取消置顶"
+                  : "置顶主题"}
+            </button>
+          </div>
+        )}
       </header>
 
       <section aria-label="主题帖子" className="post-stream">
@@ -350,7 +431,7 @@ export default function TopicDetail({
           <article className={post.number === 1 ? "post-card is-first-post" : "post-card"} id={`post-${post.id}`} key={post.id} tabIndex={-1}>
             <aside className="post-author">
               <div>
-                <span aria-hidden="true">{[...post.author.displayName][0] ?? "友"}</span>
+                <span aria-hidden="true">{post.author.avatarUrl ? <img alt="" src={post.author.avatarUrl} /> : ([...post.author.displayName][0] ?? "友")}</span>
                 <strong>{post.author.displayName}</strong>
                 <small>@{post.author.username}</small>
               </div>

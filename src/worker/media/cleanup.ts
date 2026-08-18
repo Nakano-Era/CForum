@@ -29,6 +29,17 @@ interface StaleVariantRow {
   byte_size: number;
 }
 
+interface OrphanAvatarRow {
+  id: string;
+  owner_user_id: string;
+  object_key: string;
+  byte_size: number;
+}
+
+interface OrphanAvatarVariantRow extends StaleVariantRow {
+  kind: string;
+}
+
 interface ReferenceRow {
   referenced: number;
 }
@@ -170,6 +181,89 @@ async function cleanupOneUpload(
     );
   }
   const results = await env.CFORUM_DB.batch(statements);
+  return (results[0]?.meta.changes ?? 0) === 1 ? "deleted" : "skipped";
+}
+
+async function orphanedPublicAvatars(
+  env: Bindings,
+): Promise<{ rows: OrphanAvatarRow[]; hasMore: boolean }> {
+  const result = await env.CFORUM_DB.prepare(
+    `SELECT id, owner_user_id, object_key, byte_size
+     FROM uploads avatar
+     WHERE avatar.scope = 'public'
+       AND avatar.state = 'bound'
+       AND avatar.topic_id IS NULL
+       AND avatar.post_id IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM users WHERE avatar_upload_id = avatar.id
+       )
+     ORDER BY COALESCE(avatar.bound_at, avatar.created_at), avatar.id
+     LIMIT ?1`,
+  ).bind(STALE_MEDIA_BATCH_SIZE + 1).all<OrphanAvatarRow>();
+  return {
+    rows: result.results.slice(0, STALE_MEDIA_BATCH_SIZE),
+    hasMore: result.results.length > STALE_MEDIA_BATCH_SIZE,
+  };
+}
+
+async function cleanupOrphanedPublicAvatar(
+  env: Bindings,
+  upload: OrphanAvatarRow,
+  now: number,
+): Promise<"deleted" | "skipped"> {
+  const variants = await env.CFORUM_DB.prepare(
+    `SELECT kind, object_key, byte_size
+     FROM upload_variants
+     WHERE upload_id = ?1
+     ORDER BY kind, id`,
+  ).bind(upload.id).all<OrphanAvatarVariantRow>();
+  if (
+    !isBoundObjectKey(upload.object_key, upload.id, "main") ||
+    variants.results.length !== 1 ||
+    variants.results[0]?.kind !== "thumbnail" ||
+    !isBoundObjectKey(
+      variants.results[0].object_key,
+      upload.id,
+      "thumbnail",
+    )
+  ) {
+    return "skipped";
+  }
+  const objectKeys = [upload.object_key, variants.results[0].object_key];
+  // Delete first. If R2 or the following D1 batch fails, the bound orphan row
+  // remains queryable and the next Cron pass can repeat this idempotently.
+  await env.PUBLIC_MEDIA.delete(objectKeys);
+  const storedBytes = upload.byte_size + variants.results[0].byte_size;
+  const results = await env.CFORUM_DB.batch([
+    env.CFORUM_DB.prepare(
+      `UPDATE uploads
+       SET state = 'deleted', deleted_at = ?4
+       WHERE id = ?1
+         AND owner_user_id = ?2
+         AND state = 'bound'
+         AND scope = 'public'
+         AND object_key = ?3
+         AND topic_id IS NULL
+         AND post_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM users WHERE avatar_upload_id = ?1
+         )`,
+    ).bind(upload.id, upload.owner_user_id, upload.object_key, now),
+    env.CFORUM_DB.prepare(
+      `UPDATE usage_counters
+       SET value = MAX(0, value - ?1), updated_at = ?2
+       WHERE resource = ?3
+         AND period_key = ?4
+         AND counter_key = ?5
+         AND changes() = 1`,
+    ).bind(
+      storedBytes,
+      now,
+      R2_STORAGE_USAGE_RESOURCE,
+      R2_STORAGE_PERIOD_KEY,
+      R2_STORAGE_COUNTER_KEY,
+    ),
+  ]);
   return (results[0]?.meta.changes ?? 0) === 1 ? "deleted" : "skipped";
 }
 
@@ -345,6 +439,28 @@ export async function cleanupStaleMedia(
     } catch {
       result.failed += 1;
     }
+  }
+
+  try {
+    const avatarOrphans = await orphanedPublicAvatars(env);
+    result.examined += avatarOrphans.rows.length;
+    result.hasMore ||= avatarOrphans.hasMore;
+    for (const upload of avatarOrphans.rows) {
+      try {
+        const outcome = await cleanupOrphanedPublicAvatar(
+          env,
+          upload,
+          nowSeconds,
+        );
+        if (outcome === "deleted") result.deleted += 1;
+      } catch {
+        result.failed += 1;
+        result.hasMore = true;
+      }
+    }
+  } catch {
+    result.failed += 1;
+    result.hasMore = true;
   }
 
   const namespaces: CleanupNamespace[] = [

@@ -18,6 +18,7 @@ export interface AuthUser {
   trustLevel: TrustLevel;
   role: AuthUserRole;
   status?: AuthUserStatus;
+  avatarUrl?: string | null;
 }
 
 export type AuthSessionResponse =
