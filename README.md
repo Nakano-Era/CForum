@@ -79,9 +79,8 @@ npm run build
 
 第一次部署请先按 [`docs/deployment-guide-beginner.md`](./docs/deployment-guide-beginner.md) 的 Windows PowerShell 小白教程操作；它包含首次资源创建、生产 Secret、R2 CORS、邮箱和上线验收的完整顺序。
 
-将本仓库发布到公开 GitHub 或 GitLab 仓库后，把下面的占位地址替换为真实仓库 URL：
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OWNER/cforum)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Nakano-Era/cforum)
 
 Deploy to Cloudflare 会读取 `wrangler.jsonc` 并创建/绑定 D1、R2 和 Queue。Turnstile widget、Resend API Key 与 R2 S3 API Token 不能自动创建，仍需部署者在 Cloudflare 控制台或部署表单中配置。
 
